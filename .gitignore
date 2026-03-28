@@ -1,0 +1,18 @@
+# Runtime working directories
+input_files/*
+output_bundle/*
+restore_input/*
+restore_output/*
+
+# Keep the directory structure
+!input_files/.gitkeep
+!output_bundle/.gitkeep
+!restore_input/.gitkeep
+!restore_output/.gitkeep
+
+# PowerShell and Windows noise
+*.log
+*.tmp
+*.temp
+Thumbs.db
+Desktop.ini
