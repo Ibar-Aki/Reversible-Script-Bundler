@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Bundle', 'Restore')]
+    [ValidateSet('Bundle', 'Restore', 'RestoreStructure')]
     [string]$Mode
 )
 
@@ -24,14 +24,14 @@ $Script:ExitCodes = @{
 }
 
 $Script:FormatName = 'BatchPsBundle'
-$Script:FormatVersion = '1.0'
+$Script:FormatVersion = '1.1'
 $Script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $Script:ReservedNames = @(
     'CON', 'PRN', 'AUX', 'NUL',
     'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
     'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
 )
-$Script:AllowedExtensions = @('.bat', '.ps1')
+$Script:AllowedExtensions = @('.bat', '.ps1', '.md', '.json', '.jsonl', '.bas')
 $Script:AllowedNewlineStyles = @('None', 'CRLF', 'LF', 'CR', 'Mixed')
 $Script:AllowedBomTypes = @('None', 'UTF32-LE', 'UTF32-BE', 'UTF8-BOM', 'UTF16-LE', 'UTF16-BE')
 
@@ -241,6 +241,47 @@ function Get-BundleCandidates {
     return @(Get-ChildItem -LiteralPath $RestoreInputPath -File -Filter 'bundle*.txt' | Sort-Object Name)
 }
 
+function Show-PathList {
+    param(
+        [string]$Label,
+        [string[]]$Paths
+    )
+
+    if ($null -eq $Paths -or $Paths.Count -eq 0) {
+        return
+    }
+
+    Write-Host $Label
+    foreach ($path in $Paths) {
+        Write-Host " - $path"
+    }
+}
+
+function Get-DirectoryRelativePaths {
+    param(
+        [string]$RelativePath,
+        [bool]$IncludeLeaf
+    )
+
+    $normalizedRelativePath = $RelativePath.Replace('/', '\').Trim('\')
+    if ([string]::IsNullOrWhiteSpace($normalizedRelativePath)) {
+        return @()
+    }
+
+    $segments = $normalizedRelativePath.Split('\')
+    $lastIndex = if ($IncludeLeaf) { $segments.Count - 1 } else { $segments.Count - 2 }
+    if ($lastIndex -lt 0) {
+        return @()
+    }
+
+    $directoryRelativePaths = New-Object System.Collections.ArrayList
+    for ($index = 0; $index -le $lastIndex; $index++) {
+        [void]$directoryRelativePaths.Add(($segments[0..$index] -join '\'))
+    }
+
+    return @($directoryRelativePaths)
+}
+
 function Test-IgnoredInputFile {
     param([System.IO.FileInfo]$File)
 
@@ -395,21 +436,38 @@ function Invoke-Bundle {
     Show-Start -Operation '集約' -Paths $Paths
 
     $allFiles = @(Get-ChildItem -LiteralPath $Paths.InputFiles -File -Recurse | Sort-Object FullName)
+    $allDirectories = @(Get-ChildItem -LiteralPath $Paths.InputFiles -Directory -Recurse | Sort-Object FullName)
     $ignoredFiles = @($allFiles | Where-Object { Test-IgnoredInputFile -File $_ })
     $candidateFiles = @($allFiles | Where-Object { -not (Test-IgnoredInputFile -File $_) })
+    $directoryEntries = New-Object System.Collections.ArrayList
 
-    if ($candidateFiles.Count -eq 0) {
-        Throw-HandledError -Code $Script:ExitCodes.NoInputFiles -Message "対象ファイルなし: $($Paths.InputFiles) に .bat または .ps1 を配置してください。"
+    $sortedDirectories = @($allDirectories | Sort-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
+    $directoryId = 1
+    foreach ($directory in $sortedDirectories) {
+        [void]$directoryEntries.Add([ordered]@{
+            id           = $directoryId
+            relativePath = (Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $directory.FullName)
+        })
+        $directoryId += 1
+    }
+
+    if ($candidateFiles.Count -eq 0 -and $directoryEntries.Count -eq 0) {
+        Throw-HandledError -Code $Script:ExitCodes.NoInputFiles -Message "対象ファイルなし: $($Paths.InputFiles) に対象ファイルまたはフォルダを配置してください。"
     }
 
     $invalidFiles = @($candidateFiles | Where-Object { $Script:AllowedExtensions -notcontains $_.Extension.ToLowerInvariant() })
+    $supportedFiles = @($candidateFiles | Where-Object { $Script:AllowedExtensions -contains $_.Extension.ToLowerInvariant() })
     if ($invalidFiles.Count -gt 0) {
+        Write-Host "補足       : 変換対象外の $($invalidFiles.Count) 件をスキップします。"
+        Show-PathList -Label '変換対象外ファイル一覧:' -Paths @($invalidFiles | ForEach-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
+    }
+    if ($supportedFiles.Count -eq 0 -and $invalidFiles.Count -gt 0) {
         $invalidList = ($invalidFiles | Select-Object -ExpandProperty FullName) -join ', '
-        Throw-HandledError -Code $Script:ExitCodes.InvalidExtension -Message "対象外拡張子のファイルが混在しています: $invalidList"
+        Throw-HandledError -Code $Script:ExitCodes.InvalidExtension -Message "変換可能な対象ファイルがありません。対象外ファイルのみです: $invalidList"
     }
 
     $bundleEntries = New-Object System.Collections.ArrayList
-    $sortedFiles = @($candidateFiles | Sort-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
+    $sortedFiles = @($supportedFiles | Sort-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
     $id = 1
 
     foreach ($file in $sortedFiles) {
@@ -433,6 +491,8 @@ function Invoke-Bundle {
         format    = $Script:FormatName
         version   = $Script:FormatVersion
         createdAt = (Get-Date).ToString('o')
+        dirCount  = $directoryEntries.Count
+        directories = @($directoryEntries)
         fileCount = $bundleEntries.Count
         files     = @($bundleEntries)
     }
@@ -442,8 +502,10 @@ function Invoke-Bundle {
     Write-TextFile -Path $outputPath -Content $json
 
     Show-Summary -Operation '集約' -TargetCount $bundleEntries.Count -SuccessCount $bundleEntries.Count -FailureCount 0 -OutputPath $outputPath
+    Write-Host "対象フォルダ件数 : $($directoryEntries.Count)"
     if ($ignoredFiles.Count -gt 0) {
-        Write-Host "補足       : 除外ルールに一致した $($ignoredFiles.Count) 件のファイルは無視しました。"
+        Write-Host "補足       : 除外ルールに一致した $($ignoredFiles.Count) 件のファイルを無視しました。"
+        Show-PathList -Label '除外ファイル一覧:' -Paths @($ignoredFiles | ForEach-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
     }
 }
 
@@ -499,10 +561,42 @@ function Get-RequiredEnumString {
     return $value
 }
 
+function Add-DirectoryRestoreTarget {
+    param(
+        [string]$RestoreRoot,
+        [string]$RelativeDirectoryPath,
+        [System.Collections.Generic.HashSet[string]]$KnownTargets,
+        [System.Collections.ArrayList]$DirectoryPlan
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RelativeDirectoryPath)) {
+        return
+    }
+
+    $targetDirectoryPath = Resolve-SafeRestorePath -RestoreRoot $RestoreRoot -RelativePath $RelativeDirectoryPath
+    if (-not $KnownTargets.Add($targetDirectoryPath)) {
+        return
+    }
+
+    Assert-RestoreParentPathSafe -RestoreRoot $RestoreRoot -TargetPath $targetDirectoryPath -RelativePath $RelativeDirectoryPath
+    if (Test-Path -LiteralPath $targetDirectoryPath) {
+        $item = Get-Item -LiteralPath $targetDirectoryPath -Force
+        if (-not $item.PSIsContainer) {
+            Throw-HandledError -Code $Script:ExitCodes.RestoreConflict -Message "復元先のフォルダが既存ファイルと衝突しています: $RelativeDirectoryPath -> $targetDirectoryPath"
+        }
+    }
+
+    [void]$DirectoryPlan.Add([pscustomobject]@{
+        RelativePath = $RelativeDirectoryPath
+        TargetPath   = $targetDirectoryPath
+    })
+}
+
 function Invoke-Restore {
     param([System.Collections.IDictionary]$Paths)
 
-    Show-Start -Operation '復元' -Paths $Paths
+    $operationLabel = if ($Mode -eq 'RestoreStructure') { 'フォルダ構成復元' } else { '復元' }
+    Show-Start -Operation $operationLabel -Paths $Paths
 
     $bundleCandidates = @(Get-BundleCandidates -RestoreInputPath $Paths.RestoreInput)
     if ($bundleCandidates.Count -eq 0) {
@@ -530,6 +624,20 @@ function Invoke-Restore {
 
     [void](Get-RequiredString -Object $bundleObject -PropertyName 'version' -Context '集約ファイル')
     [void](Get-RequiredString -Object $bundleObject -PropertyName 'createdAt' -Context '集約ファイル')
+    $dirCount = 0
+    $dirRecords = @()
+    if ($bundleObject.PSObject.Properties['directories']) {
+        $dirRecords = @($bundleObject.directories)
+    }
+    if ($bundleObject.PSObject.Properties['dirCount']) {
+        $dirCount = Get-RequiredInteger -Object $bundleObject -PropertyName 'dirCount' -Context '集約ファイル'
+        if ($dirRecords.Count -ne $dirCount) {
+            Throw-HandledError -Code $Script:ExitCodes.InvalidFormat -Message "dirCount とディレクトリ件数が一致しません。宣言件数: $dirCount / 実件数: $($dirRecords.Count)"
+        }
+    }
+    else {
+        $dirCount = $dirRecords.Count
+    }
     $fileCount = Get-RequiredInteger -Object $bundleObject -PropertyName 'fileCount' -Context '集約ファイル'
 
     $fileRecords = @($bundleObject.files)
@@ -537,9 +645,28 @@ function Invoke-Restore {
         Throw-HandledError -Code $Script:ExitCodes.InvalidFormat -Message "fileCount と実データ件数が一致しません。宣言件数: $fileCount / 実件数: $($fileRecords.Count)"
     }
 
+    $directoryPlan = New-Object System.Collections.ArrayList
+    $plannedDirectoryTargets = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+    $directoryRecordIds = New-Object System.Collections.Generic.HashSet[int]
     $restorePlan = New-Object System.Collections.Generic.List[object]
     $plannedTargets = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
     $recordIds = New-Object System.Collections.Generic.HashSet[int]
+
+    foreach ($directoryRecord in $dirRecords) {
+        $directoryRecordId = Get-RequiredInteger -Object $directoryRecord -PropertyName 'id' -Context 'ディレクトリレコード'
+        $directoryRelativePath = Get-RequiredString -Object $directoryRecord -PropertyName 'relativePath' -Context "ディレクトリレコード $directoryRecordId"
+
+        if ($directoryRecordId -le 0) {
+            Throw-HandledError -Code $Script:ExitCodes.InvalidFormat -Message "ディレクトリ id は 1 以上である必要があります: $directoryRelativePath"
+        }
+        if (-not $directoryRecordIds.Add($directoryRecordId)) {
+            Throw-HandledError -Code $Script:ExitCodes.InvalidFormat -Message "ディレクトリ id が重複しています: $directoryRecordId"
+        }
+
+        foreach ($directoryChainPath in (Get-DirectoryRelativePaths -RelativePath $directoryRelativePath -IncludeLeaf $true)) {
+            Add-DirectoryRestoreTarget -RestoreRoot $Paths.RestoreOutput -RelativeDirectoryPath $directoryChainPath -KnownTargets $plannedDirectoryTargets -DirectoryPlan $directoryPlan
+        }
+    }
 
     foreach ($record in $fileRecords) {
         $recordId = Get-RequiredInteger -Object $record -PropertyName 'id' -Context 'ファイルレコード'
@@ -590,12 +717,20 @@ function Invoke-Restore {
             Throw-HandledError -Code $Script:ExitCodes.InvalidFormat -Message "bomType が実データと一致しません: $relativePath"
         }
 
+        foreach ($directoryChainPath in (Get-DirectoryRelativePaths -RelativePath $relativePath -IncludeLeaf $false)) {
+            Add-DirectoryRestoreTarget -RestoreRoot $Paths.RestoreOutput -RelativeDirectoryPath $directoryChainPath -KnownTargets $plannedDirectoryTargets -DirectoryPlan $directoryPlan
+        }
+
         $targetPath = Resolve-SafeRestorePath -RestoreRoot $Paths.RestoreOutput -RelativePath $relativePath
         if (-not $plannedTargets.Add($targetPath)) {
             Throw-HandledError -Code $Script:ExitCodes.InvalidFormat -Message "同一の復元先パスが重複しています: $relativePath"
         }
 
         if (Test-Path -LiteralPath $targetPath) {
+            $existingTarget = Get-Item -LiteralPath $targetPath -Force
+            if ($existingTarget.PSIsContainer) {
+                Throw-HandledError -Code $Script:ExitCodes.RestoreConflict -Message "復元先のファイルパスが既存フォルダと衝突しています: $targetPath"
+            }
             Throw-HandledError -Code $Script:ExitCodes.RestoreConflict -Message "復元先に同名ファイルが存在します: $targetPath"
         }
         Assert-RestoreParentPathSafe -RestoreRoot $Paths.RestoreOutput -TargetPath $targetPath -RelativePath $relativePath
@@ -607,12 +742,22 @@ function Invoke-Restore {
         })
     }
 
+    foreach ($directoryItem in @($directoryPlan | Sort-Object { $_.TargetPath.Length }, TargetPath)) {
+        Ensure-Directory -Path $directoryItem.TargetPath
+    }
+
+    if ($Mode -eq 'RestoreStructure') {
+        Show-Summary -Operation $operationLabel -TargetCount $directoryPlan.Count -SuccessCount $directoryPlan.Count -FailureCount 0 -OutputPath $Paths.RestoreOutput
+        Write-Host "対象フォルダ件数 : $($directoryPlan.Count)"
+        return
+    }
+
     foreach ($item in $restorePlan) {
-        Ensure-Directory -Path ([System.IO.Path]::GetDirectoryName($item.TargetPath))
         Write-BytesFile -Path $item.TargetPath -Bytes $item.Bytes
     }
 
-    Show-Summary -Operation '復元' -TargetCount $restorePlan.Count -SuccessCount $restorePlan.Count -FailureCount 0 -OutputPath $Paths.RestoreOutput
+    Show-Summary -Operation $operationLabel -TargetCount $restorePlan.Count -SuccessCount $restorePlan.Count -FailureCount 0 -OutputPath $Paths.RestoreOutput
+    Write-Host "対象フォルダ件数 : $($directoryPlan.Count)"
 }
 
 try {
@@ -622,6 +767,7 @@ try {
     switch ($Mode) {
         'Bundle' { Invoke-Bundle -Paths $paths }
         'Restore' { Invoke-Restore -Paths $paths }
+        'RestoreStructure' { Invoke-Restore -Paths $paths }
         default { Throw-HandledError -Code $Script:ExitCodes.Unexpected -Message "未対応のモードです: $Mode" }
     }
 
