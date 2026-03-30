@@ -1,6 +1,7 @@
 # Runtime working directories
 input_files/*
 output_bundle/*
+
 restore_input/*
 restore_output/*
 
