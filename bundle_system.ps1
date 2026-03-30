@@ -154,11 +154,46 @@ function Get-NewlineStyle {
     return 'Mixed'
 }
 
-function Get-UniqueBundlePath {
-    param([string]$OutputDirectory)
+function Convert-ToSafeFileNameSegment {
+    param([string]$Value)
 
-    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $baseName = "bundle_$timestamp"
+    $safeValue = $Value
+    foreach ($invalidChar in [System.IO.Path]::GetInvalidFileNameChars()) {
+        $safeValue = $safeValue.Replace([string]$invalidChar, '_')
+    }
+
+    $safeValue = $safeValue.Trim()
+    if ([string]::IsNullOrWhiteSpace($safeValue)) {
+        return 'input_files'
+    }
+
+    return $safeValue
+}
+
+function Get-BundleBaseName {
+    param([string]$InputDirectory)
+
+    $datePart = Get-Date -Format 'yyMMdd'
+    $topLevelDirectories = @(Get-ChildItem -LiteralPath $InputDirectory -Directory | Sort-Object Name)
+    $topLevelFiles = @(Get-ChildItem -LiteralPath $InputDirectory -File | Where-Object { -not (Test-IgnoredInputFile -File $_) } | Sort-Object Name)
+
+    if ($topLevelDirectories.Count -eq 1 -and $topLevelFiles.Count -eq 0) {
+        $namePart = Convert-ToSafeFileNameSegment -Value $topLevelDirectories[0].Name
+    }
+    else {
+        $namePart = 'input_files'
+    }
+
+    return "bundle_${datePart}_$namePart"
+}
+
+function Get-UniqueBundlePath {
+    param(
+        [string]$OutputDirectory,
+        [string]$InputDirectory
+    )
+
+    $baseName = Get-BundleBaseName -InputDirectory $InputDirectory
     $candidate = Join-Path -Path $OutputDirectory -ChildPath "$baseName.txt"
     $counter = 1
 
@@ -286,7 +321,7 @@ function Test-IgnoredInputFile {
     param([System.IO.FileInfo]$File)
 
     $name = $File.Name.ToLowerInvariant()
-    if ($name -in @('thumbs.db', 'desktop.ini')) {
+    if ($name -in @('thumbs.db', 'desktop.ini', '.gitkeep')) {
         return $true
     }
     if ($name -like 'bundle*.txt') {
@@ -497,7 +532,7 @@ function Invoke-Bundle {
         files     = @($bundleEntries)
     }
 
-    $outputPath = Get-UniqueBundlePath -OutputDirectory $Paths.OutputBundle
+    $outputPath = Get-UniqueBundlePath -OutputDirectory $Paths.OutputBundle -InputDirectory $Paths.InputFiles
     $json = $bundleObject | ConvertTo-Json -Depth 5
     Write-TextFile -Path $outputPath -Content $json
 
