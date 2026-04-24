@@ -1,79 +1,177 @@
 # バッチ／PowerShellファイル可逆変換システム
 
 - 作成日: 2026-03-28 17:42 JST
-- 更新日: 2026-03-30
+- 更新日: 2026-04-24
 - 作成者: Codex (GPT-5)
 
 ## 概要
 
-`.bat`、`.ps1`、`.md`、`.json`、`.jsonl`、`.bas` を 1 つのテキストファイルへ集約し、その集約ファイルから元の複数ファイルとフォルダ構成を復元する Windows 向けツールです。起動は `.bat`、内部処理は PowerShell で行います。
+`.bat`、`.ps1`、`.psm1`、`.md`、`.json`、`.jsonl`、`.bas` を 1 つの UTF-8 JSON テキストへ集約し、その集約ファイルから元の複数ファイルとフォルダ構成を復元する Windows 向けツールです。起動は `.bat`、内部処理は PowerShell で行います。
+
+固定フォルダ運用に加えて、任意の入出力パス指定、`.bundleignore`、`verify`、機械可読な結果 JSON 出力に対応します。
 
 ## ファイル構成
 
-- `bundle_files.bat`: 集約を実行します。
-- `restore_files.bat`: 復元を実行します。`restore_files.bat structure` でフォルダ構成のみ復元します。
-- `bundle_system.ps1`: 集約と復元の共通処理です。
+- `bundle_files.bat`: 集約または検証を実行します。
+- `restore_files.bat`: 復元またはフォルダ構成のみ復元を実行します。
+- `bundle_launcher.ps1`: `.bat` 起動時のモード判定、引数透過、一時停止制御を行います。
+- `bundle_system.ps1`: 集約・復元・検証の共通処理です。
+- `tests\BundleSystem.Tests.ps1`: Pester テストです。
 
-## 固定フォルダ構成
+## 対応拡張子
 
-初回実行時に以下のフォルダを自動作成します。
+- `.bat`
+- `.ps1`
+- `.psm1`
+- `.md`
+- `.json`
+- `.jsonl`
+- `.bas`
 
-- `input_files`: 集約対象の `.bat` / `.ps1` / `.md` / `.json` / `.jsonl` / `.bas` を配置します。
-- `output_bundle`: 集約結果の `bundle_YYMMDD_フォルダ名.txt` を出力します。
-- `restore_input`: 復元したい集約ファイルを 1 件だけ配置します。
-- `restore_output`: 復元結果の出力先です。
+## 従来の固定フォルダ構成
 
-## 操作手順
+引数を省略した場合は、従来通り次のフォルダを使います。存在しなければ自動作成します。
 
-### 集約
+- `input_files`
+- `output_bundle`
+- `restore_input`
+- `restore_output`
 
-1. `input_files` 配下に `.bat`、`.ps1`、`.md`、`.json`、`.jsonl`、`.bas` を配置します。サブフォルダも対象です。
-2. `bundle_files.bat` を実行します。
-3. `output_bundle` に集約ファイルが 1 件出力されます。
-4. 実行後、コマンドプロンプト画面は自動で閉じません。
+## 主要な使い方
 
-### 復元
+### 1. 従来運用のまま集約
 
-1. `restore_input` に `bundle*.txt` を 1 件だけ配置します。
-2. `restore_files.bat` を実行します。
-3. `restore_output` に元の相対パス構成でファイルが復元されます。
-4. 実行後、コマンドプロンプト画面は自動で閉じません。
+```cmd
+bundle_files.bat
+```
 
-### フォルダ構成のみ復元
+### 2. 任意のフォルダを直接集約
 
-1. `restore_input` に `bundle*.txt` を 1 件だけ配置します。
-2. `restore_files.bat structure` を実行します。
-3. `restore_output` にフォルダ構成のみを復元し、ファイル本体は出力しません。
-4. 実行後、コマンドプロンプト画面は自動で閉じません。
+```cmd
+bundle_files.bat --no-pause -InputPath "C:\Work\MyProject" -OutputPath "D:\bundle_out"
+```
+
+### 3. `.bundleignore` を使って集約
+
+`.bundleignore` を入力ルート直下に置くか、明示的に `-IgnoreFilePath` を渡します。
+
+```cmd
+bundle_files.bat --no-pause -InputPath "C:\Work\MyProject" -OutputPath "D:\bundle_out" -IgnoreFilePath "C:\Work\MyProject\.bundleignore"
+```
+
+### 4. 復元
+
+```cmd
+restore_files.bat --no-pause -RestoreInputPath "D:\bundle_out\bundle_260424_MyProject.txt" -RestoreOutputPath "D:\restore_out"
+```
+
+`-RestoreInputPath` は、`bundle*.txt` を 1 件だけ置いたフォルダでも、個別の bundle ファイルでも指定できます。
+
+### 5. フォルダ構成のみ復元
+
+```cmd
+restore_files.bat structure --no-pause -RestoreInputPath "D:\bundle_out\bundle_260424_MyProject.txt" -RestoreOutputPath "D:\restore_out"
+```
+
+### 6. 往復検証
+
+```cmd
+bundle_files.bat verify --no-pause -InputPath "C:\Work\MyProject" -OutputPath "D:\bundle_out" -RestoreOutputPath "D:\verify_restore"
+```
+
+## PowerShell 引数
+
+`bundle_system.ps1` は次のモードに対応します。
+
+- `-Mode Bundle`
+- `-Mode Restore`
+- `-Mode RestoreStructure`
+- `-Mode Verify`
+
+主な引数:
+
+- `-InputPath`: 集約または検証対象の入力ルート
+- `-OutputPath`: bundle 出力先ディレクトリ
+- `-RestoreInputPath`: 復元対象の bundle ファイル、またはその格納ディレクトリ
+- `-RestoreOutputPath`: 復元先ディレクトリ
+- `-IgnoreFilePath`: `.bundleignore` の明示パス
+- `-BundleRootName`: bundle 内の相対パス先頭に付けるルートフォルダ名
+- `-ResultJsonPath`: 実行結果サマリを JSON で出力するパス
+
+## `.bundleignore`
+
+入力ルート直下の `.bundleignore` を自動検出します。明示パスを渡した場合はそちらを優先します。
+
+書式:
+
+- 空行は無視
+- `#` で始まる行はコメント
+- `node_modules` のような単純名は、同名セグメントを含む配下を除外
+- `dist/output` のような相対パスは、その配下を除外
+- `docs/*.md` のようなワイルドカードも利用可能
+
+例:
+
+```text
+# build artifacts
+node_modules
+dist
+coverage
+docs/private
+```
+
+## 出力 bundle JSON の追加メタデータ
+
+bundle ファイルには次を含めます。
+
+- `sourceRoot`
+- `excludedDirectories`
+- `toolVersion`
+- `createdBy`
+- `hostname`
+
+従来の `format`, `version`, `directories`, `files` なども維持します。
+
+## 結果 JSON
+
+`-ResultJsonPath` を指定すると、実行結果サマリを UTF-8 JSON で出力します。成功時は次のような情報を含みます。
+
+- `Status`
+- `Operation`
+- `ExitCode`
+- `ToolVersion`
+- `SourceRoot`
+- `BundlePath`
+- `RestoreOutputPath`
+- `BundledFileCount`
+- `BundledDirectoryCount`
+- `VerifiedFileCount`
+- `VerifiedDirectoryCount`
+
+失敗時も `Status=Error` と `Message` を含む JSON を出力します。
 
 ## 仕様上のポイント
 
-- 集約ファイルは UTF-8 JSON テキストです。
-- 出力名は `input_files` 直下に 1 つだけ置かれたフォルダ名を使い、`bundle_YYMMDD_フォルダ名.txt` 形式で生成します。
-- `input_files` 直下が複数フォルダまたは直下ファイル混在の場合は、安全な代替名として `bundle_YYMMDD_input_files.txt` を使います。
-- 集約時はファイルだけでなく、空フォルダを含む相対フォルダ構成も記録します。
+- bundle 本体は UTF-8 JSON テキストです。
 - 各ファイル本文は Base64 で保持し、復元時は生バイト列をそのまま書き戻します。
 - 通常復元ではフォルダ構成を先に再構築してからファイルを書き戻します。
 - `structure` モードではフォルダ構成のみ復元し、ファイルは生成しません。
-- `id`、`relativePath`、`fileName`、`extension`、`byteLength`、`sha256`、`newlineStyle`、`bomType` を使って復元前に整合性を検証します。
-- 並び順は `input_files` から見た相対パス昇順です。
+- `verify` モードでは bundle 作成、復元、SHA-256 とフォルダ構成の照合を連続で行います。
+- 復元前に `id`, `relativePath`, `fileName`, `extension`, `byteLength`, `sha256`, `newlineStyle`, `bomType` を検証します。
 - `.bat` 起動時は処理結果を確認できるよう、終了前に一時停止します。自動実行したい場合は `--no-pause` を付けます。
 
 ## 上書き方針
 
 - 復元先に同名ファイルが 1 件でも存在した場合は、何も復元せずに停止します。
+- 親ディレクトリ位置のファイル衝突も検出して停止します。
 - 標準動作で上書きは行いません。
 
 ## 制約事項
 
-- 対象拡張子は `.bat`、`.ps1`、`.md`、`.json`、`.jsonl`、`.bas` です。
-- `input_files` では `bundle*.txt`、`.gitkeep`、`thumbs.db`、`desktop.ini`、`~$*`、`*.tmp`、`*.temp` を自動除外します。
-- 上記以外の対象外ファイルが混在していても、対象内ファイルが 1 件以上あれば対象外ファイル名をコマンドプロンプトに一覧表示したうえでスキップします。
-- 対象外ファイルしか存在しない場合は終了コード `11` で停止します。
-- `restore_input` には集約ファイルを 1 件だけ置いてください。複数件ある場合はエラー終了します。
-- 復元時は危険な相対パス、絶対パス、予約名、禁止文字を含むパスを拒否します。
-- 復元時は既存ファイルだけでなく、親ディレクトリ位置のファイル衝突も検出して停止します。
 - 本ツールは暗号化、圧縮、署名付与、ネットワーク連携、GUI を行いません。
+- 対象外ファイルが混在していても、対象内ファイルが 1 件以上あれば一覧表示したうえでスキップします。
+- 対象外ファイルしか存在しない場合は終了コード `11` で停止します。
+- 復元時は危険な相対パス、絶対パス、予約名、禁止文字を含むパスを拒否します。
 
 ## 終了コード
 
@@ -89,5 +187,24 @@
 | `22` | フォーマット不正 |
 | `23` | パス不正 |
 | `24` | 復元先衝突 |
+| `25` | verify 照合失敗 |
 | `30` | 権限不足 |
 | `99` | 想定外エラー |
+
+## テスト
+
+Pester 3.4 で次を検証します。
+
+- 任意パスからの bundle 作成
+- `.bundleignore`
+- `-BundleRootName` による復元ルート保持
+- bundle / restore のバッチ引数透過
+- `!`, `&`, `%` を含むパスのバッチ引数透過
+- UTF-8 BOM / UTF-8 / UTF-16 LE / CP932 の往復一致
+- `verify` モード
+
+実行例:
+
+```powershell
+Invoke-Pester -Path .\tests\BundleSystem.Tests.ps1
+```

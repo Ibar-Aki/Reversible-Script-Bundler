@@ -1,17 +1,14 @@
 @echo off
-setlocal
-set "MODE=Restore"
-set "SHOULD_PAUSE=1"
-
-:parse_args
-if "%~1"=="" goto run
-if /I "%~1"=="structure" set "MODE=RestoreStructure"
-if /I "%~1"=="--no-pause" set "SHOULD_PAUSE=0"
-shift
-goto parse_args
-
-:run
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0bundle_system.ps1" -Mode %MODE%
+setlocal EnableDelayedExpansion
+for %%I in ("%~f0") do set "SCRIPT_DIR=%%~dpI"
+set "BUNDLE_ORIGINAL_CMDCMDLINE=!CMDCMDLINE!"
+setlocal DisableDelayedExpansion
+set "EXIT_PARENT_FLAG=%TEMP%\bundle_exit_parent_%RANDOM%_%RANDOM%.flag"
+if exist "%EXIT_PARENT_FLAG%" del "%EXIT_PARENT_FLAG%" >nul 2>nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%bundle_launcher.ps1" -DefaultMode Restore -SystemPath "%SCRIPT_DIR%bundle_system.ps1" -BatchPath "%~f0" -ExitParentFlagPath "%EXIT_PARENT_FLAG%"
 set "EXIT_CODE=%ERRORLEVEL%"
-if "%SHOULD_PAUSE%"=="1" pause
+if exist "%EXIT_PARENT_FLAG%" (
+    del "%EXIT_PARENT_FLAG%" >nul 2>nul
+    endlocal & exit %EXIT_CODE%
+)
 endlocal & exit /b %EXIT_CODE%

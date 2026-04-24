@@ -1,8 +1,15 @@
 ﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Bundle', 'Restore', 'RestoreStructure')]
-    [string]$Mode
+    [ValidateSet('Bundle', 'Restore', 'RestoreStructure', 'Verify')]
+    [string]$Mode,
+    [string]$InputPath,
+    [string]$OutputPath,
+    [string]$RestoreInputPath,
+    [string]$RestoreOutputPath,
+    [string]$IgnoreFilePath,
+    [string]$BundleRootName,
+    [string]$ResultJsonPath
 )
 
 Set-StrictMode -Version Latest
@@ -19,21 +26,26 @@ $Script:ExitCodes = @{
     InvalidFormat       = 22
     InvalidPath         = 23
     RestoreConflict     = 24
+    VerifyMismatch      = 25
     PermissionDenied    = 30
     Unexpected          = 99
 }
 
 $Script:FormatName = 'BatchPsBundle'
-$Script:FormatVersion = '1.1'
+$Script:FormatVersion = '1.2'
+$Script:ToolVersion = '1.2.0'
 $Script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $Script:ReservedNames = @(
     'CON', 'PRN', 'AUX', 'NUL',
     'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
     'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
 )
-$Script:AllowedExtensions = @('.bat', '.ps1', '.md', '.json', '.jsonl', '.bas')
+$Script:AllowedExtensions = @('.bat', '.ps1', '.psm1', '.md', '.json', '.jsonl', '.bas')
 $Script:AllowedNewlineStyles = @('None', 'CRLF', 'LF', 'CR', 'Mixed')
 $Script:AllowedBomTypes = @('None', 'UTF32-LE', 'UTF32-BE', 'UTF8-BOM', 'UTF16-LE', 'UTF16-BE')
+$Script:Hostname = [System.Environment]::MachineName
+$Script:ResultPath = $null
+$Script:ScriptRoot = Split-Path -Parent $PSCommandPath
 
 function Throw-HandledError {
     param(
@@ -46,6 +58,21 @@ function Throw-HandledError {
     throw $exception
 }
 
+function Get-CurrentUserName {
+    try {
+        return [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    }
+    catch {
+        if ([string]::IsNullOrWhiteSpace($env:USERNAME)) {
+            return 'unknown-user'
+        }
+
+        return $env:USERNAME
+    }
+}
+
+$Script:CreatedBy = Get-CurrentUserName
+
 function Ensure-Directory {
     param([string]$Path)
 
@@ -54,22 +81,25 @@ function Ensure-Directory {
     }
 }
 
-function Initialize-WorkingFolders {
-    param([string]$RootPath)
+function Resolve-ExistingPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
 
-    $paths = [ordered]@{
-        Root         = $RootPath
-        InputFiles   = Join-Path -Path $RootPath -ChildPath 'input_files'
-        OutputBundle = Join-Path -Path $RootPath -ChildPath 'output_bundle'
-        RestoreInput = Join-Path -Path $RootPath -ChildPath 'restore_input'
-        RestoreOutput = Join-Path -Path $RootPath -ChildPath 'restore_output'
+    try {
+        return [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path)
     }
-
-    foreach ($path in $paths.Values) {
-        Ensure-Directory -Path $path
+    catch [System.UnauthorizedAccessException] {
+        Throw-HandledError -Code $Script:ExitCodes.PermissionDenied -Message "権限不足でパスへアクセスできません: $Path"
     }
+    catch {
+        Throw-HandledError -Code $Script:ExitCodes.InvalidPath -Message "パスが存在しません: $Path"
+    }
+}
 
-    return $paths
+function Get-DefaultRootPath {
+    return [System.IO.Path]::GetFullPath($Script:ScriptRoot)
 }
 
 function Get-RelativePath {
@@ -88,6 +118,34 @@ function Get-RelativePath {
     $targetUri = New-Object System.Uri([System.IO.Path]::GetFullPath($TargetPath))
     $relativeUri = $baseUri.MakeRelativeUri($targetUri)
     return [System.Uri]::UnescapeDataString($relativeUri.ToString()).Replace('/', '\')
+}
+
+function Join-BundleRelativePath {
+    param(
+        [string]$BundleRootName,
+        [string]$RelativePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BundleRootName)) {
+        return $RelativePath
+    }
+
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) {
+        return $BundleRootName
+    }
+
+    return (Join-Path -Path $BundleRootName -ChildPath $RelativePath)
+}
+
+function Get-BundleRelativePath {
+    param(
+        [string]$InputRoot,
+        [string]$TargetPath,
+        [string]$BundleRootName
+    )
+
+    $relativePath = Get-RelativePath -BasePath $InputRoot -TargetPath $TargetPath
+    return Join-BundleRelativePath -BundleRootName $BundleRootName -RelativePath $relativePath
 }
 
 function Get-Sha256Hex {
@@ -171,11 +229,26 @@ function Convert-ToSafeFileNameSegment {
 }
 
 function Get-BundleBaseName {
-    param([string]$InputDirectory)
+    param(
+        [string]$InputDirectory,
+        [bool]$UseDirectoryLeafName
+    )
 
     $datePart = Get-Date -Format 'yyMMdd'
-    $topLevelDirectories = @(Get-ChildItem -LiteralPath $InputDirectory -Directory | Sort-Object Name)
-    $topLevelFiles = @(Get-ChildItem -LiteralPath $InputDirectory -File | Where-Object { -not (Test-IgnoredInputFile -File $_) } | Sort-Object Name)
+    if ($UseDirectoryLeafName) {
+        $namePart = Convert-ToSafeFileNameSegment -Value (Split-Path -Leaf $InputDirectory)
+        return "bundle_${datePart}_$namePart"
+    }
+
+    $topLevelDirectories = @(
+        Get-ChildItem -LiteralPath $InputDirectory -Directory |
+            Sort-Object Name
+    )
+    $topLevelFiles = @(
+        Get-ChildItem -LiteralPath $InputDirectory -File |
+            Where-Object { -not (Test-IgnoredInputFile -File $_) } |
+            Sort-Object Name
+    )
 
     if ($topLevelDirectories.Count -eq 1 -and $topLevelFiles.Count -eq 0) {
         $namePart = Convert-ToSafeFileNameSegment -Value $topLevelDirectories[0].Name
@@ -190,10 +263,11 @@ function Get-BundleBaseName {
 function Get-UniqueBundlePath {
     param(
         [string]$OutputDirectory,
-        [string]$InputDirectory
+        [string]$InputDirectory,
+        [bool]$UseDirectoryLeafName
     )
 
-    $baseName = Get-BundleBaseName -InputDirectory $InputDirectory
+    $baseName = Get-BundleBaseName -InputDirectory $InputDirectory -UseDirectoryLeafName $UseDirectoryLeafName
     $candidate = Join-Path -Path $OutputDirectory -ChildPath "$baseName.txt"
     $counter = 1
 
@@ -270,12 +344,6 @@ function Resolve-SafeRestorePath {
     return $fullPath
 }
 
-function Get-BundleCandidates {
-    param([string]$RestoreInputPath)
-
-    return @(Get-ChildItem -LiteralPath $RestoreInputPath -File -Filter 'bundle*.txt' | Sort-Object Name)
-}
-
 function Show-PathList {
     param(
         [string]$Label,
@@ -321,7 +389,7 @@ function Test-IgnoredInputFile {
     param([System.IO.FileInfo]$File)
 
     $name = $File.Name.ToLowerInvariant()
-    if ($name -in @('thumbs.db', 'desktop.ini', '.gitkeep')) {
+    if ($name -in @('thumbs.db', 'desktop.ini', '.gitkeep', '.bundleignore')) {
         return $true
     }
     if ($name -like 'bundle*.txt') {
@@ -427,6 +495,26 @@ function Read-JsonFile {
     }
 }
 
+function Get-CreatedAt {
+    return (Get-Date).ToString('o')
+}
+
+function Write-ResultObject {
+    param([hashtable]$ResultObject)
+
+    if ([string]::IsNullOrWhiteSpace($Script:ResultPath)) {
+        return
+    }
+
+    $directoryPath = Split-Path -Parent $Script:ResultPath
+    if (-not [string]::IsNullOrWhiteSpace($directoryPath)) {
+        Ensure-Directory -Path $directoryPath
+    }
+
+    $json = $ResultObject | ConvertTo-Json -Depth 10
+    Write-TextFile -Path $Script:ResultPath -Content $json
+}
+
 function Show-Start {
     param(
         [string]$Operation,
@@ -435,12 +523,15 @@ function Show-Start {
 
     Write-Host ('=' * 60)
     Write-Host "処理種別 : $Operation"
-    if ($Operation -eq '集約') {
-        Write-Host "入力元     : $($Paths.InputFiles)"
+    Write-Host "入力元     : $($Paths.InputFiles)"
+    if ($Operation -like '集約*' -or $Operation -eq '検証') {
         Write-Host "出力先     : $($Paths.OutputBundle)"
+        if (-not [string]::IsNullOrWhiteSpace($Paths.IgnoreRulePath)) {
+            Write-Host "ignore     : $($Paths.IgnoreRulePath)"
+        }
     }
     else {
-        Write-Host "入力元     : $($Paths.RestoreInput)"
+        Write-Host "集約入力元 : $($Paths.RestoreInput)"
         Write-Host "復元先     : $($Paths.RestoreOutput)"
     }
     Write-Host ('=' * 60)
@@ -465,82 +556,389 @@ function Show-Summary {
     Write-Host '完了メッセージ: 処理が完了しました。'
 }
 
+function Resolve-BundlePaths {
+    $scriptRoot = Get-DefaultRootPath
+    $isDefaultInputPath = [string]::IsNullOrWhiteSpace($InputPath)
+    $resolvedInputPath = if ($isDefaultInputPath) { Join-Path -Path $scriptRoot -ChildPath 'input_files' } else { Resolve-ExistingPath -Path $InputPath }
+    $resolvedOutputPath = if ([string]::IsNullOrWhiteSpace($OutputPath)) { Join-Path -Path $scriptRoot -ChildPath 'output_bundle' } else { [System.IO.Path]::GetFullPath($OutputPath) }
+    $effectiveIgnoreFilePath = $null
+    $effectiveBundleRootName = $null
+
+    if (-not (Test-Path -LiteralPath $resolvedInputPath)) {
+        if ($isDefaultInputPath) {
+            Ensure-Directory -Path $resolvedInputPath
+        }
+        else {
+            Throw-HandledError -Code $Script:ExitCodes.InvalidPath -Message "InputPath が存在しません: $resolvedInputPath"
+        }
+    }
+
+    $inputItem = Get-Item -LiteralPath $resolvedInputPath -Force
+    if (-not $inputItem.PSIsContainer) {
+        Throw-HandledError -Code $Script:ExitCodes.InvalidPath -Message "InputPath はフォルダである必要があります: $resolvedInputPath"
+    }
+
+    Ensure-Directory -Path $resolvedOutputPath
+
+    if (-not [string]::IsNullOrWhiteSpace($IgnoreFilePath)) {
+        $effectiveIgnoreFilePath = Resolve-ExistingPath -Path $IgnoreFilePath
+        if (-not (Get-Item -LiteralPath $effectiveIgnoreFilePath -Force).PSIsContainer) {
+            # no-op
+        }
+        else {
+            Throw-HandledError -Code $Script:ExitCodes.InvalidPath -Message "IgnoreFilePath はファイルである必要があります: $effectiveIgnoreFilePath"
+        }
+    }
+    else {
+        $defaultIgnore = Join-Path -Path $resolvedInputPath -ChildPath '.bundleignore'
+        if (Test-Path -LiteralPath $defaultIgnore -PathType Leaf) {
+            $effectiveIgnoreFilePath = [System.IO.Path]::GetFullPath($defaultIgnore)
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($BundleRootName)) {
+        $effectiveBundleRootName = Convert-ToSafeFileNameSegment -Value $BundleRootName
+        if ($effectiveBundleRootName -ne $BundleRootName.Trim()) {
+            Throw-HandledError -Code $Script:ExitCodes.InvalidPath -Message "BundleRootName にファイル名として使えない文字が含まれています: $BundleRootName"
+        }
+    }
+
+    return [ordered]@{
+        Root                 = $scriptRoot
+        InputFiles           = [System.IO.Path]::GetFullPath($resolvedInputPath)
+        OutputBundle         = [System.IO.Path]::GetFullPath($resolvedOutputPath)
+        IgnoreRulePath       = $effectiveIgnoreFilePath
+        BundleRootName       = $effectiveBundleRootName
+        UseDirectoryLeafName = ($isDefaultInputPath -eq $false) -or ((Split-Path -Leaf $resolvedInputPath) -ne 'input_files')
+    }
+}
+
+function Resolve-RestorePaths {
+    $scriptRoot = Get-DefaultRootPath
+    $resolvedRestoreInputPath = $null
+    $explicitBundleFile = $null
+
+    if ([string]::IsNullOrWhiteSpace($RestoreInputPath)) {
+        $resolvedRestoreInputPath = Join-Path -Path $scriptRoot -ChildPath 'restore_input'
+        Ensure-Directory -Path $resolvedRestoreInputPath
+    }
+    else {
+        $restoreInputFullPath = Resolve-ExistingPath -Path $RestoreInputPath
+        $restoreInputItem = Get-Item -LiteralPath $restoreInputFullPath -Force
+        if ($restoreInputItem.PSIsContainer) {
+            $resolvedRestoreInputPath = $restoreInputFullPath
+        }
+        else {
+            $explicitBundleFile = $restoreInputFullPath
+            $resolvedRestoreInputPath = Split-Path -Parent $restoreInputFullPath
+        }
+    }
+
+    $resolvedRestoreOutputPath = if ([string]::IsNullOrWhiteSpace($RestoreOutputPath)) { Join-Path -Path $scriptRoot -ChildPath 'restore_output' } else { [System.IO.Path]::GetFullPath($RestoreOutputPath) }
+    Ensure-Directory -Path $resolvedRestoreOutputPath
+
+    return [ordered]@{
+        Root             = $scriptRoot
+        InputFiles       = $null
+        OutputBundle     = $null
+        RestoreInput     = [System.IO.Path]::GetFullPath($resolvedRestoreInputPath)
+        RestoreOutput    = [System.IO.Path]::GetFullPath($resolvedRestoreOutputPath)
+        ExplicitBundle   = $explicitBundleFile
+        IgnoreRulePath   = $null
+        UseDirectoryLeafName = $false
+    }
+}
+
+function Resolve-VerifyPaths {
+    $bundlePaths = Resolve-BundlePaths
+    $verifyRoot = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("bundle_verify_{0}" -f ([Guid]::NewGuid().ToString('N')))
+    Ensure-Directory -Path $verifyRoot
+
+    $restoreInputPath = if ([string]::IsNullOrWhiteSpace($RestoreInputPath)) { Join-Path -Path $verifyRoot -ChildPath 'restore_input' } else { [System.IO.Path]::GetFullPath($RestoreInputPath) }
+    $restoreOutputPath = if ([string]::IsNullOrWhiteSpace($RestoreOutputPath)) { Join-Path -Path $verifyRoot -ChildPath 'restore_output' } else { [System.IO.Path]::GetFullPath($RestoreOutputPath) }
+    Ensure-Directory -Path $restoreInputPath
+    Ensure-Directory -Path $restoreOutputPath
+
+    $bundlePaths['RestoreInput'] = [System.IO.Path]::GetFullPath($restoreInputPath)
+    $bundlePaths['RestoreOutput'] = [System.IO.Path]::GetFullPath($restoreOutputPath)
+    $bundlePaths['VerifyWorkspace'] = [System.IO.Path]::GetFullPath($verifyRoot)
+    $bundlePaths['CleanupVerifyWorkspace'] = $true
+    return $bundlePaths
+}
+
+function Read-IgnoreRules {
+    param([string]$IgnoreRulePath)
+
+    if ([string]::IsNullOrWhiteSpace($IgnoreRulePath)) {
+        return @()
+    }
+
+    try {
+        $lines = Get-Content -LiteralPath $IgnoreRulePath -ErrorAction Stop
+    }
+    catch [System.UnauthorizedAccessException] {
+        Throw-HandledError -Code $Script:ExitCodes.PermissionDenied -Message "ignore ファイルの読み取り権限がありません: $IgnoreRulePath"
+    }
+    catch {
+        Throw-HandledError -Code $Script:ExitCodes.ReadFailure -Message "ignore ファイルを読み取れませんでした: $IgnoreRulePath"
+    }
+
+    $rules = New-Object System.Collections.ArrayList
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ($trimmed.StartsWith('#')) { continue }
+
+        $isDirectoryRule = $trimmed.EndsWith('/') -or $trimmed.EndsWith('\')
+        $normalized = $trimmed.TrimStart('.', '\', '/').Replace('\', '/').TrimEnd('/')
+        if ([string]::IsNullOrWhiteSpace($normalized)) { continue }
+
+        $hasWildcard = $normalized.IndexOfAny(@([char]'*', [char]'?', [char]'[')) -ge 0
+        $hasPathSeparator = $normalized.Contains('/')
+
+        $ruleType = if (-not $hasWildcard -and -not $hasPathSeparator) {
+            'Segment'
+        }
+        elseif (-not $hasWildcard) {
+            'Prefix'
+        }
+        else {
+            'Wildcard'
+        }
+
+        $patternText = if ($ruleType -eq 'Wildcard' -and $isDirectoryRule) { "$normalized/*" } else { $normalized }
+
+        [void]$rules.Add([pscustomobject]@{
+            Original        = $trimmed
+            Normalized      = $normalized.ToLowerInvariant()
+            RuleType        = $ruleType
+            IsDirectoryRule = $isDirectoryRule
+            Pattern         = if ($ruleType -eq 'Wildcard') {
+                [System.Management.Automation.WildcardPattern]::new($patternText.ToLowerInvariant(), [System.Management.Automation.WildcardOptions]::IgnoreCase)
+            }
+            else {
+                $null
+            }
+        })
+    }
+
+    return @($rules)
+}
+
+function Test-IgnoreRuleMatch {
+    param(
+        [string]$RelativePath,
+        [bool]$IsDirectory,
+        [object[]]$Rules
+    )
+
+    if ($null -eq $Rules -or @($Rules).Count -eq 0) {
+        return $false
+    }
+
+    $normalizedRelativePath = $RelativePath.Replace('\', '/').Trim('/').ToLowerInvariant()
+    $segments = if ([string]::IsNullOrWhiteSpace($normalizedRelativePath)) { @() } else { $normalizedRelativePath.Split('/') }
+
+    foreach ($rule in $Rules) {
+        switch ($rule.RuleType) {
+            'Segment' {
+                if ($segments -contains $rule.Normalized) {
+                    return $true
+                }
+            }
+            'Prefix' {
+                if ($normalizedRelativePath -eq $rule.Normalized -or $normalizedRelativePath.StartsWith($rule.Normalized + '/')) {
+                    return $true
+                }
+            }
+            'Wildcard' {
+                if ($rule.Pattern.IsMatch($normalizedRelativePath)) {
+                    return $true
+                }
+                if ($rule.IsDirectoryRule -and ($normalizedRelativePath -eq $rule.Normalized -or $normalizedRelativePath.StartsWith($rule.Normalized + '/'))) {
+                    return $true
+                }
+            }
+        }
+    }
+
+    return $false
+}
+
+function Get-InputSnapshot {
+    param(
+        [string]$InputRoot,
+        [object[]]$IgnoreRules,
+        [string]$BundleRootName
+    )
+
+    $ignoredBySystem = New-Object System.Collections.ArrayList
+    $ignoredByRulesFiles = New-Object System.Collections.ArrayList
+    $ignoredByRulesDirectories = New-Object System.Collections.ArrayList
+    $candidateFiles = New-Object System.Collections.ArrayList
+    $directoryEntries = New-Object System.Collections.ArrayList
+
+    if (-not [string]::IsNullOrWhiteSpace($BundleRootName)) {
+        [void]$directoryEntries.Add($BundleRootName)
+    }
+
+    $pendingDirectories = New-Object System.Collections.Queue
+    $pendingDirectories.Enqueue((Get-Item -LiteralPath $InputRoot))
+
+    while ($pendingDirectories.Count -gt 0) {
+        $currentDirectory = $pendingDirectories.Dequeue()
+
+        try {
+            $childDirectories = @(Get-ChildItem -LiteralPath $currentDirectory.FullName -Directory -ErrorAction Stop | Sort-Object FullName)
+            $childFiles = @(Get-ChildItem -LiteralPath $currentDirectory.FullName -File -ErrorAction Stop | Sort-Object FullName)
+        }
+        catch [System.UnauthorizedAccessException] {
+            Throw-HandledError -Code $Script:ExitCodes.PermissionDenied -Message "読み取り権限がありません: $($currentDirectory.FullName)"
+        }
+        catch {
+            Throw-HandledError -Code $Script:ExitCodes.ReadFailure -Message "フォルダを読み取れませんでした: $($currentDirectory.FullName)"
+        }
+
+        foreach ($directory in $childDirectories) {
+            $relativePath = Get-RelativePath -BasePath $InputRoot -TargetPath $directory.FullName
+            if (Test-IgnoreRuleMatch -RelativePath $relativePath -IsDirectory $true -Rules $IgnoreRules) {
+                [void]$ignoredByRulesDirectories.Add($relativePath)
+                continue
+            }
+
+            [void]$directoryEntries.Add((Join-BundleRelativePath -BundleRootName $BundleRootName -RelativePath $relativePath))
+            $pendingDirectories.Enqueue($directory)
+        }
+
+        foreach ($file in $childFiles) {
+            $relativePath = Get-RelativePath -BasePath $InputRoot -TargetPath $file.FullName
+            if (Test-IgnoredInputFile -File $file) {
+                [void]$ignoredBySystem.Add($relativePath)
+                continue
+            }
+            if (Test-IgnoreRuleMatch -RelativePath $relativePath -IsDirectory $false -Rules $IgnoreRules) {
+                [void]$ignoredByRulesFiles.Add($relativePath)
+                continue
+            }
+            [void]$candidateFiles.Add($file)
+        }
+    }
+
+    $supportedFiles = @($candidateFiles | Where-Object { $Script:AllowedExtensions -contains $_.Extension.ToLowerInvariant() } | Sort-Object FullName)
+    $invalidFiles = @($candidateFiles | Where-Object { $Script:AllowedExtensions -notcontains $_.Extension.ToLowerInvariant() } | Sort-Object FullName)
+
+    return [pscustomobject]@{
+        DirectoryRelativePaths = @($directoryEntries | Sort-Object)
+        IgnoredSystemPaths     = @($ignoredBySystem | Sort-Object)
+        IgnoredByRulesFiles    = @($ignoredByRulesFiles | Sort-Object)
+        IgnoredByRulesDirs     = @($ignoredByRulesDirectories | Sort-Object)
+        SupportedFiles         = $supportedFiles
+        InvalidFiles           = $invalidFiles
+    }
+}
+
 function Invoke-Bundle {
     param([System.Collections.IDictionary]$Paths)
 
     Show-Start -Operation '集約' -Paths $Paths
 
-    $allFiles = @(Get-ChildItem -LiteralPath $Paths.InputFiles -File -Recurse | Sort-Object FullName)
-    $allDirectories = @(Get-ChildItem -LiteralPath $Paths.InputFiles -Directory -Recurse | Sort-Object FullName)
-    $ignoredFiles = @($allFiles | Where-Object { Test-IgnoredInputFile -File $_ })
-    $candidateFiles = @($allFiles | Where-Object { -not (Test-IgnoredInputFile -File $_) })
-    $directoryEntries = New-Object System.Collections.ArrayList
+    $ignoreRules = Read-IgnoreRules -IgnoreRulePath $Paths.IgnoreRulePath
+    $snapshot = Get-InputSnapshot -InputRoot $Paths.InputFiles -IgnoreRules $ignoreRules -BundleRootName $Paths.BundleRootName
 
-    $sortedDirectories = @($allDirectories | Sort-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
+    if ($snapshot.SupportedFiles.Count -eq 0 -and $snapshot.InvalidFiles.Count -eq 0 -and $snapshot.DirectoryRelativePaths.Count -eq 0) {
+        Throw-HandledError -Code $Script:ExitCodes.NoInputFiles -Message "対象ファイルなし: $($Paths.InputFiles) に対象ファイルまたはフォルダを配置してください。"
+    }
+
+    if ($snapshot.InvalidFiles.Count -gt 0) {
+        Write-Host "補足       : 変換対象外の $($snapshot.InvalidFiles.Count) 件をスキップします。"
+        Show-PathList -Label '変換対象外ファイル一覧:' -Paths @($snapshot.InvalidFiles | ForEach-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
+    }
+
+    if ($snapshot.SupportedFiles.Count -eq 0 -and $snapshot.InvalidFiles.Count -gt 0) {
+        $invalidList = ($snapshot.InvalidFiles | Select-Object -ExpandProperty FullName) -join ', '
+        Throw-HandledError -Code $Script:ExitCodes.InvalidExtension -Message "変換可能な対象ファイルがありません。対象外ファイルのみです: $invalidList"
+    }
+
+    $directoryEntries = New-Object System.Collections.ArrayList
     $directoryId = 1
-    foreach ($directory in $sortedDirectories) {
+    foreach ($relativeDirectoryPath in $snapshot.DirectoryRelativePaths) {
         [void]$directoryEntries.Add([ordered]@{
             id           = $directoryId
-            relativePath = (Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $directory.FullName)
+            relativePath = $relativeDirectoryPath
         })
         $directoryId += 1
     }
 
-    if ($candidateFiles.Count -eq 0 -and $directoryEntries.Count -eq 0) {
-        Throw-HandledError -Code $Script:ExitCodes.NoInputFiles -Message "対象ファイルなし: $($Paths.InputFiles) に対象ファイルまたはフォルダを配置してください。"
-    }
-
-    $invalidFiles = @($candidateFiles | Where-Object { $Script:AllowedExtensions -notcontains $_.Extension.ToLowerInvariant() })
-    $supportedFiles = @($candidateFiles | Where-Object { $Script:AllowedExtensions -contains $_.Extension.ToLowerInvariant() })
-    if ($invalidFiles.Count -gt 0) {
-        Write-Host "補足       : 変換対象外の $($invalidFiles.Count) 件をスキップします。"
-        Show-PathList -Label '変換対象外ファイル一覧:' -Paths @($invalidFiles | ForEach-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
-    }
-    if ($supportedFiles.Count -eq 0 -and $invalidFiles.Count -gt 0) {
-        $invalidList = ($invalidFiles | Select-Object -ExpandProperty FullName) -join ', '
-        Throw-HandledError -Code $Script:ExitCodes.InvalidExtension -Message "変換可能な対象ファイルがありません。対象外ファイルのみです: $invalidList"
-    }
-
     $bundleEntries = New-Object System.Collections.ArrayList
-    $sortedFiles = @($supportedFiles | Sort-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
+    $sortedFiles = @($snapshot.SupportedFiles | Sort-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
     $id = 1
 
     foreach ($file in $sortedFiles) {
-        $relativePath = Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $file.FullName
+        $relativePath = Get-BundleRelativePath -InputRoot $Paths.InputFiles -TargetPath $file.FullName -BundleRootName $Paths.BundleRootName
         $bytes = Read-Bytes -Path $file.FullName
         [void]$bundleEntries.Add([ordered]@{
-            id           = $id
-            relativePath = $relativePath
-            fileName     = $file.Name
-            extension    = $file.Extension.ToLowerInvariant()
-            byteLength   = $bytes.Length
-            sha256       = Get-Sha256Hex -Bytes $bytes
-            newlineStyle = Get-NewlineStyle -Bytes $bytes
-            bomType      = Get-BomType -Bytes $bytes
+            id            = $id
+            relativePath  = $relativePath
+            fileName      = $file.Name
+            extension     = $file.Extension.ToLowerInvariant()
+            byteLength    = $bytes.Length
+            sha256        = Get-Sha256Hex -Bytes $bytes
+            newlineStyle  = Get-NewlineStyle -Bytes $bytes
+            bomType       = Get-BomType -Bytes $bytes
             contentBase64 = [System.Convert]::ToBase64String($bytes)
         })
         $id += 1
     }
 
     $bundleObject = [ordered]@{
-        format    = $Script:FormatName
-        version   = $Script:FormatVersion
-        createdAt = (Get-Date).ToString('o')
-        dirCount  = $directoryEntries.Count
-        directories = @($directoryEntries)
-        fileCount = $bundleEntries.Count
-        files     = @($bundleEntries)
+        format              = $Script:FormatName
+        version             = $Script:FormatVersion
+        toolVersion         = $Script:ToolVersion
+        createdAt           = Get-CreatedAt
+        createdBy           = $Script:CreatedBy
+        hostname            = $Script:Hostname
+        sourceRoot          = [System.IO.Path]::GetFullPath($Paths.InputFiles)
+        excludedDirectories = @($snapshot.IgnoredByRulesDirs)
+        dirCount            = $directoryEntries.Count
+        directories         = @($directoryEntries)
+        fileCount           = $bundleEntries.Count
+        files               = @($bundleEntries)
     }
 
-    $outputPath = Get-UniqueBundlePath -OutputDirectory $Paths.OutputBundle -InputDirectory $Paths.InputFiles
-    $json = $bundleObject | ConvertTo-Json -Depth 5
+    $outputPath = Get-UniqueBundlePath -OutputDirectory $Paths.OutputBundle -InputDirectory $Paths.InputFiles -UseDirectoryLeafName $Paths.UseDirectoryLeafName
+    $json = $bundleObject | ConvertTo-Json -Depth 6
     Write-TextFile -Path $outputPath -Content $json
 
     Show-Summary -Operation '集約' -TargetCount $bundleEntries.Count -SuccessCount $bundleEntries.Count -FailureCount 0 -OutputPath $outputPath
     Write-Host "対象フォルダ件数 : $($directoryEntries.Count)"
-    if ($ignoredFiles.Count -gt 0) {
-        Write-Host "補足       : 除外ルールに一致した $($ignoredFiles.Count) 件のファイルを無視しました。"
-        Show-PathList -Label '除外ファイル一覧:' -Paths @($ignoredFiles | ForEach-Object { Get-RelativePath -BasePath $Paths.InputFiles -TargetPath $_.FullName })
+    if ($snapshot.IgnoredSystemPaths.Count -gt 0) {
+        Write-Host "補足       : 除外ルールに一致した $($snapshot.IgnoredSystemPaths.Count) 件のファイルを無視しました。"
+        Show-PathList -Label '除外ファイル一覧:' -Paths $snapshot.IgnoredSystemPaths
+    }
+    if ($snapshot.IgnoredByRulesDirs.Count -gt 0 -or $snapshot.IgnoredByRulesFiles.Count -gt 0) {
+        Write-Host "補足       : .bundleignore に一致したフォルダ $($snapshot.IgnoredByRulesDirs.Count) 件、ファイル $($snapshot.IgnoredByRulesFiles.Count) 件を無視しました。"
+        Show-PathList -Label 'ignore 対象フォルダ一覧:' -Paths $snapshot.IgnoredByRulesDirs
+        Show-PathList -Label 'ignore 対象ファイル一覧:' -Paths $snapshot.IgnoredByRulesFiles
+    }
+
+    return [ordered]@{
+        Status               = 'Success'
+        Operation            = 'Bundle'
+        ExitCode             = $Script:ExitCodes.Success
+        ToolVersion          = $Script:ToolVersion
+        FormatVersion        = $Script:FormatVersion
+        CreatedAt            = Get-CreatedAt
+        CreatedBy            = $Script:CreatedBy
+        Hostname             = $Script:Hostname
+        SourceRoot           = [System.IO.Path]::GetFullPath($Paths.InputFiles)
+        OutputDirectory      = [System.IO.Path]::GetFullPath($Paths.OutputBundle)
+        BundlePath           = $outputPath
+        BundledFileCount     = $bundleEntries.Count
+        BundledDirectoryCount = $directoryEntries.Count
+        SupportedExtensions  = $Script:AllowedExtensions
+        IgnoreFilePath       = $Paths.IgnoreRulePath
+        ExcludedDirectories  = @($snapshot.IgnoredByRulesDirs)
+        IgnoredFilePaths     = @($snapshot.IgnoredSystemPaths + $snapshot.IgnoredByRulesFiles)
     }
 }
 
@@ -627,13 +1025,28 @@ function Add-DirectoryRestoreTarget {
     })
 }
 
+function Get-BundleCandidates {
+    param(
+        [string]$RestoreInputPath,
+        [string]$ExplicitBundlePath
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitBundlePath)) {
+        return ,(Get-Item -LiteralPath $ExplicitBundlePath -Force)
+    }
+
+    return @(Get-ChildItem -LiteralPath $RestoreInputPath -File -Filter 'bundle*.txt' | Sort-Object Name)
+}
+
 function Invoke-Restore {
-    param([System.Collections.IDictionary]$Paths)
+    param(
+        [System.Collections.IDictionary]$Paths,
+        [string]$OperationLabel
+    )
 
-    $operationLabel = if ($Mode -eq 'RestoreStructure') { 'フォルダ構成復元' } else { '復元' }
-    Show-Start -Operation $operationLabel -Paths $Paths
+    Show-Start -Operation $OperationLabel -Paths $Paths
 
-    $bundleCandidates = @(Get-BundleCandidates -RestoreInputPath $Paths.RestoreInput)
+    $bundleCandidates = @(Get-BundleCandidates -RestoreInputPath $Paths.RestoreInput -ExplicitBundlePath $Paths.ExplicitBundle)
     if ($bundleCandidates.Count -eq 0) {
         Throw-HandledError -Code $Script:ExitCodes.BundleNotFound -Message "復元用の集約ファイルが見つかりません: $($Paths.RestoreInput)"
     }
@@ -659,6 +1072,8 @@ function Invoke-Restore {
 
     [void](Get-RequiredString -Object $bundleObject -PropertyName 'version' -Context '集約ファイル')
     [void](Get-RequiredString -Object $bundleObject -PropertyName 'createdAt' -Context '集約ファイル')
+    $sourceRoot = if ($bundleObject.PSObject.Properties['sourceRoot']) { [string]$bundleObject.sourceRoot } else { $null }
+    $excludedDirectories = if ($bundleObject.PSObject.Properties['excludedDirectories']) { @($bundleObject.excludedDirectories) } else { @() }
     $dirCount = 0
     $dirRecords = @()
     if ($bundleObject.PSObject.Properties['directories']) {
@@ -782,30 +1197,217 @@ function Invoke-Restore {
     }
 
     if ($Mode -eq 'RestoreStructure') {
-        Show-Summary -Operation $operationLabel -TargetCount $directoryPlan.Count -SuccessCount $directoryPlan.Count -FailureCount 0 -OutputPath $Paths.RestoreOutput
+        Show-Summary -Operation $OperationLabel -TargetCount $directoryPlan.Count -SuccessCount $directoryPlan.Count -FailureCount 0 -OutputPath $Paths.RestoreOutput
         Write-Host "対象フォルダ件数 : $($directoryPlan.Count)"
-        return
+
+        return [ordered]@{
+            Status                = 'Success'
+            Operation             = 'RestoreStructure'
+            ExitCode              = $Script:ExitCodes.Success
+            ToolVersion           = $Script:ToolVersion
+            CreatedAt             = Get-CreatedAt
+            CreatedBy             = $Script:CreatedBy
+            Hostname              = $Script:Hostname
+            BundlePath            = $bundlePath
+            RestoreOutputPath     = [System.IO.Path]::GetFullPath($Paths.RestoreOutput)
+            RestoredFileCount     = 0
+            RestoredDirectoryCount = $directoryPlan.Count
+            SourceRoot            = $sourceRoot
+            ExcludedDirectories   = $excludedDirectories
+        }
     }
 
     foreach ($item in $restorePlan) {
         Write-BytesFile -Path $item.TargetPath -Bytes $item.Bytes
     }
 
-    Show-Summary -Operation $operationLabel -TargetCount $restorePlan.Count -SuccessCount $restorePlan.Count -FailureCount 0 -OutputPath $Paths.RestoreOutput
+    Show-Summary -Operation $OperationLabel -TargetCount $restorePlan.Count -SuccessCount $restorePlan.Count -FailureCount 0 -OutputPath $Paths.RestoreOutput
     Write-Host "対象フォルダ件数 : $($directoryPlan.Count)"
+
+    return [ordered]@{
+        Status                = 'Success'
+        Operation             = 'Restore'
+        ExitCode              = $Script:ExitCodes.Success
+        ToolVersion           = $Script:ToolVersion
+        CreatedAt             = Get-CreatedAt
+        CreatedBy             = $Script:CreatedBy
+        Hostname              = $Script:Hostname
+        BundlePath            = $bundlePath
+        RestoreOutputPath     = [System.IO.Path]::GetFullPath($Paths.RestoreOutput)
+        RestoredFileCount     = $restorePlan.Count
+        RestoredDirectoryCount = $directoryPlan.Count
+        SourceRoot            = $sourceRoot
+        ExcludedDirectories   = $excludedDirectories
+    }
+}
+
+function Get-RestoreSnapshot {
+    param([string]$RestoreRoot)
+
+    $fileMap = @{}
+    $files = @(Get-ChildItem -LiteralPath $RestoreRoot -File -Recurse | Sort-Object FullName)
+    foreach ($file in $files) {
+        $relativePath = Get-RelativePath -BasePath $RestoreRoot -TargetPath $file.FullName
+        $fileMap[$relativePath] = Get-Sha256Hex -Bytes (Read-Bytes -Path $file.FullName)
+    }
+
+    return [pscustomobject]@{
+        FileMap = $fileMap
+        DirectoryRelativePaths = @(
+            Get-ChildItem -LiteralPath $RestoreRoot -Directory -Recurse |
+                ForEach-Object { Get-RelativePath -BasePath $RestoreRoot -TargetPath $_.FullName } |
+                Sort-Object
+        )
+    }
+}
+
+function Compare-StringArrays {
+    param(
+        [string[]]$Expected,
+        [string[]]$Actual
+    )
+
+    if ($Expected.Count -ne $Actual.Count) {
+        return $false
+    }
+
+    for ($index = 0; $index -lt $Expected.Count; $index += 1) {
+        if ($Expected[$index] -ne $Actual[$index]) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Invoke-Verify {
+    param([System.Collections.IDictionary]$Paths)
+
+    Show-Start -Operation '検証' -Paths $Paths
+
+    $ignoreRules = Read-IgnoreRules -IgnoreRulePath $Paths.IgnoreRulePath
+    $sourceSnapshot = Get-InputSnapshot -InputRoot $Paths.InputFiles -IgnoreRules $ignoreRules -BundleRootName $Paths.BundleRootName
+
+    $bundleResult = Invoke-Bundle -Paths $Paths
+
+    $bundleTarget = Join-Path -Path $Paths.RestoreInput -ChildPath ([System.IO.Path]::GetFileName($bundleResult.BundlePath))
+    Copy-Item -LiteralPath $bundleResult.BundlePath -Destination $bundleTarget -Force
+
+    $restorePaths = [ordered]@{
+        RestoreInput        = $Paths.RestoreInput
+        RestoreOutput       = $Paths.RestoreOutput
+        ExplicitBundle      = $bundleTarget
+        InputFiles          = $Paths.InputFiles
+        OutputBundle        = $Paths.OutputBundle
+        IgnoreRulePath      = $Paths.IgnoreRulePath
+        UseDirectoryLeafName = $Paths.UseDirectoryLeafName
+    }
+    $restoreResult = Invoke-Restore -Paths $restorePaths -OperationLabel '検証復元'
+
+    $restoredSnapshot = Get-RestoreSnapshot -RestoreRoot $Paths.RestoreOutput
+    $expectedFileMap = @{}
+    foreach ($file in $sourceSnapshot.SupportedFiles) {
+        $relativePath = Get-BundleRelativePath -InputRoot $Paths.InputFiles -TargetPath $file.FullName -BundleRootName $Paths.BundleRootName
+        $expectedFileMap[$relativePath] = Get-Sha256Hex -Bytes (Read-Bytes -Path $file.FullName)
+    }
+
+    if ($expectedFileMap.Count -ne $restoredSnapshot.FileMap.Count) {
+        Throw-HandledError -Code $Script:ExitCodes.VerifyMismatch -Message "検証失敗: 復元ファイル件数が一致しません。期待 $($expectedFileMap.Count) 件 / 実際 $($restoredSnapshot.FileMap.Count) 件"
+    }
+
+    foreach ($relativePath in $expectedFileMap.Keys) {
+        if (-not $restoredSnapshot.FileMap.ContainsKey($relativePath)) {
+            Throw-HandledError -Code $Script:ExitCodes.VerifyMismatch -Message "検証失敗: 復元結果にファイルがありません: $relativePath"
+        }
+        if ($restoredSnapshot.FileMap[$relativePath] -ne $expectedFileMap[$relativePath]) {
+            Throw-HandledError -Code $Script:ExitCodes.VerifyMismatch -Message "検証失敗: SHA-256 が一致しません: $relativePath"
+        }
+    }
+
+    $expectedDirectories = @($sourceSnapshot.DirectoryRelativePaths | Sort-Object)
+    $actualDirectories = @($restoredSnapshot.DirectoryRelativePaths | Sort-Object)
+    if (-not (Compare-StringArrays -Expected $expectedDirectories -Actual $actualDirectories)) {
+        Throw-HandledError -Code $Script:ExitCodes.VerifyMismatch -Message '検証失敗: 復元フォルダ構成が一致しません。'
+    }
+
+    Write-Host ''
+    Write-Host '検証結果   : 正常終了'
+    Write-Host "検証対象   : $($expectedFileMap.Count) ファイル / $($expectedDirectories.Count) フォルダ"
+    Write-Host "bundle     : $($bundleResult.BundlePath)"
+    Write-Host "restore    : $($restoreResult.RestoreOutputPath)"
+
+    return [ordered]@{
+        Status                = 'Success'
+        Operation             = 'Verify'
+        ExitCode              = $Script:ExitCodes.Success
+        ToolVersion           = $Script:ToolVersion
+        CreatedAt             = Get-CreatedAt
+        CreatedBy             = $Script:CreatedBy
+        Hostname              = $Script:Hostname
+        SourceRoot            = [System.IO.Path]::GetFullPath($Paths.InputFiles)
+        BundlePath            = $bundleResult.BundlePath
+        RestoreOutputPath     = $restoreResult.RestoreOutputPath
+        VerifiedFileCount     = $expectedFileMap.Count
+        VerifiedDirectoryCount = $expectedDirectories.Count
+        IgnoreFilePath        = $Paths.IgnoreRulePath
+        ExcludedDirectories   = @($sourceSnapshot.IgnoredByRulesDirs)
+        VerifyWorkspace       = $Paths.VerifyWorkspace
+    }
+}
+
+function Remove-VerifyWorkspaceIfInternal {
+    param([System.Collections.IDictionary]$Paths)
+
+    if ($null -eq $Paths) {
+        return
+    }
+
+    if (-not $Paths.Contains('CleanupVerifyWorkspace') -or -not $Paths.CleanupVerifyWorkspace) {
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Paths.VerifyWorkspace)) {
+        return
+    }
+
+    if (Test-Path -LiteralPath $Paths.VerifyWorkspace) {
+        try {
+            Remove-Item -LiteralPath $Paths.VerifyWorkspace -Recurse -Force
+        }
+        catch {
+            Write-Host "補足       : 検証用一時フォルダを削除できませんでした: $($Paths.VerifyWorkspace)"
+        }
+    }
 }
 
 try {
-    $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-    $paths = Initialize-WorkingFolders -RootPath $scriptRoot
+    $paths = $null
+    $Script:ResultPath = if ([string]::IsNullOrWhiteSpace($ResultJsonPath)) { $null } else { [System.IO.Path]::GetFullPath($ResultJsonPath) }
 
     switch ($Mode) {
-        'Bundle' { Invoke-Bundle -Paths $paths }
-        'Restore' { Invoke-Restore -Paths $paths }
-        'RestoreStructure' { Invoke-Restore -Paths $paths }
-        default { Throw-HandledError -Code $Script:ExitCodes.Unexpected -Message "未対応のモードです: $Mode" }
+        'Bundle' {
+            $paths = Resolve-BundlePaths
+            $result = Invoke-Bundle -Paths $paths
+        }
+        'Restore' {
+            $paths = Resolve-RestorePaths
+            $result = Invoke-Restore -Paths $paths -OperationLabel '復元'
+        }
+        'RestoreStructure' {
+            $paths = Resolve-RestorePaths
+            $result = Invoke-Restore -Paths $paths -OperationLabel 'フォルダ構成復元'
+        }
+        'Verify' {
+            $paths = Resolve-VerifyPaths
+            $result = Invoke-Verify -Paths $paths
+        }
+        default {
+            Throw-HandledError -Code $Script:ExitCodes.Unexpected -Message "未対応のモードです: $Mode"
+        }
     }
 
+    Remove-VerifyWorkspaceIfInternal -Paths $paths
+    Write-ResultObject -ResultObject $result
     exit $Script:ExitCodes.Success
 }
 catch {
@@ -821,5 +1423,18 @@ catch {
     Write-Host "処理結果   : 異常終了"
     Write-Host "終了コード : $exitCode"
     Write-Host "エラー内容 : $($_.Exception.Message)"
+
+    $errorResult = [ordered]@{
+        Status      = 'Error'
+        Operation   = $Mode
+        ExitCode    = $exitCode
+        ToolVersion = $Script:ToolVersion
+        CreatedAt   = Get-CreatedAt
+        CreatedBy   = $Script:CreatedBy
+        Hostname    = $Script:Hostname
+        Message     = $_.Exception.Message
+    }
+    Remove-VerifyWorkspaceIfInternal -Paths $paths
+    Write-ResultObject -ResultObject $errorResult
     exit $exitCode
 }

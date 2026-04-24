@@ -1,15 +1,30 @@
 # テスト結果
 
 - 作成日: 2026-03-28 17:42 JST
-- 更新日: 2026-03-28
+- 更新日: 2026-04-24
 - 作成者: Codex (GPT-5)
 
 ## 実施前提
 
 - 実行環境: Windows 11 / `powershell.exe` 5.1
+- テスト実行: Pester 3.4.0
 - 対象フォルダ: `C:\Work_Codex\ps1,batの変換器`
 
 ## 実施結果
+
+### 2026-04-24 拡張機能回帰
+
+- 対象機能: `-InputPath`, `-OutputPath`, `-RestoreInputPath`, `-RestoreOutputPath`, `-BundleRootName`, `.bundleignore`, `verify`, `-ResultJsonPath`, bundle JSON 追加メタデータ, バッチ引数透過
+- 実行コマンド: `Invoke-Pester -Path .\tests\BundleSystem.Tests.ps1`
+- 結果: 6 passed, 0 failed
+- 確認内容:
+  - 任意パス指定で bundle / restore が成功
+  - `.bundleignore` による除外、除外配下の探索抑止、`excludedDirectories` 記録を確認
+  - `-BundleRootName` による `<ProjectName>\...` 復元形状を確認
+  - `bundle_files.bat` / `restore_files.bat` からの引数透過と `!`, `&`, `%` 入りパス対応を確認
+  - UTF-8 BOM / UTF-8 / UTF-16 LE / CP932 の往復でバイト一致
+  - `verify` モードで SHA-256 とフォルダ構成の照合成功、および内部一時フォルダ削除を確認
+  - `-ResultJsonPath` に成功時 JSON が出力されることを確認
 
 ### `Excel2LLM_Share` 実データ検証
 
